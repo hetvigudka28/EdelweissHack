@@ -1,102 +1,136 @@
 import socket
 import struct
+import threading
+from confluent_kafka import Producer
+from datetime import datetime
+from scipy.stats import norm
+from math import log, sqrt, exp
 
-#code run on terminal is:  java -Ddebug=true -Dspeed=1.0 -classpath feed-play-1.0.jar hackathon.player.Main dataset.csv 9011
+def calculate_call_price(S, K, r, sigma, T):
+    d1 = (log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt(T))
+    d2 = d1 - sigma * sqrt(T)
 
-# Define the server address and port
-server_address = ('localhost', 9011)
+    call_price = S * norm.cdf(d1) - K * exp(-r * T) * norm.cdf(d2)
+    return call_price
 
-# Create a TCP/IP socket
-client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def find_first_number_index(string):
+    for i, char in enumerate(string):
+        if char.isdigit():
+            return i
 
-# Set a timeout value of 10 seconds
-client_socket.settimeout(600)
+    return -1
 
-try:
-    # Connect to the server
-    client_socket.connect(server_address)
+def get_slice_until_index(string, index):
+    if index >= 0:
+        return string[:index]
+    else:
+        return string
 
-    # Send the initial request
-    client_socket.sendall(b'\x01')  # Sending a single byte packet indicating readiness
+kafka_bootstrap_servers = 'localhost:9092'
+kafka_topic = 'option-data'
+producer = Producer({'bootstrap.servers': kafka_bootstrap_servers})
 
-    # Receive the snapshot data from the server
-    snapshot_data = client_socket.recv(130)  # Assuming the snapshot data packet size is fixed at 130 bytes
-    print("Received snapshot data size:", len(snapshot_data))
-    print("Snapshot Data:", snapshot_data)
-
-    # Unpack the snapshot data
-    packet_size, symbol, sequence, timestamp, ltp, ltq, volume, bid_price, bid_qty, ask_price, ask_qty, open_interest, prev_close, prev_open_interest = struct.unpack(
-        '<I30sQQQQQQQQQQQQ', snapshot_data)
-
-    total = 1
-    # Decode the symbol string
+def process_packet(packet):
+    try:
+        packet_size, symbol, sequence, timestamp, ltp, ltq, volume, bid_price, bid_qty, ask_price, ask_qty, open_interest, prev_close, prev_open_interest = struct.unpack(
+            '<I30sQQQQQQQQQQQQ', packet)
+    except struct.error as e:
+        print("Error unpacking fields:", e)
+        return
     symbol = symbol.decode('utf-8').rstrip('\x00')
 
-    # Print the unpacked fields
-    print("Unpacked snapshot data:")
-    print("Symbol:", symbol)
-    print("Sequence Number:", sequence)
-    print("Timestamp:", timestamp)
-    print("Last Traded Price (LTP):", ltp)
-    print("Last Traded Quantity (LTQ):", ltq)
-    print("Volume:", volume)
-    print("Bid Price:", bid_price)
-    print("Bid Quantity:", bid_qty)
-    print("Ask Price:", ask_price)
-    print("Ask Quantity:", ask_qty)
-    print("Open Interest:", open_interest)
-    print("Previous Close Price:", prev_close)
-    print("Previous Open Interest:", prev_open_interest)
+    index = find_first_number_index(symbol)
+    underlying = get_slice_until_index(symbol, index)
+    if index != -1:
+        expiry_date = symbol[index:index + 7]
+    else:
+        expiry_date = '-'
 
-    # Continue receiving real-time updates from the server
+    if index != -1:
+        type = symbol[-2:]
+    else:
+        type = '-'
+
+    if type != 'XX':
+        strike = int(symbol[index + 7:-2])
+    else:
+        strike = 0
+
+    if type == 'CE': type = 'Call'
+    if type == 'PE': type = 'Put'
+    if type == 'Call' or type == 'Put':
+        current_datetime = datetime.now()
+        expiry_date_str = expiry_date  # Example expiry date string
+        expiry_date_date = datetime.strptime(expiry_date_str, "%d%b%y")
+        time_to_maturity = expiry_date_date - current_datetime
+        days_to_maturity = time_to_maturity.days
+        iv = calculate_call_price(ltp, strike, 5, 0.2, days_to_maturity)
+
+    change_in_oi = open_interest - prev_open_interest
+    change_price = (ltp - prev_close) if ltp > 0 else 0
+    packet_data = {
+        "open_interest": open_interest,
+        "change_in_oi": change_in_oi,
+        "volume": volume,
+        "iv": iv if iv else 0,
+        "ltp": ltp,
+        "change_price": change_price,
+        "bid_qty": bid_qty,
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+        "ask_qty": ask_qty,
+        "strike-price": strike,
+        "symbol": symbol,
+        "underlying": underlying,
+        "expiry_date": expiry_date,
+        "type": type,
+        "sequence": sequence,
+        "timestamp": timestamp,
+        "ltq": ltq,
+        "prev_close": prev_close,
+        "prev_open_interest": prev_open_interest,
+    }
+    print(packet_data)
+    producer.produce(kafka_topic, key=symbol, value=str(packet_data))
+    producer.flush()
+
+
+def receive_packets(client_socket):
     while True:
-        print("TOTAL PACKETS SEEN:", total)
-
         try:
             data = client_socket.recv(130)
         except socket.timeout:
-            # Handle timeout, no data received within the timeout period
-            print("Timeout occurred. No data received.")
+            print("Timeout occured")
+            break
+        except OSError as e:
+            print("Socket error:", e)
             break
 
-
-
-        # Unpack the real-time update data
-        packet_size = struct.unpack('<I', data[:4])[0]
-
-        if packet_size != 124:
-            print("Invalid packet size. Skipping packet:", packet_size)
+        packet_size = len(data)
+        if packet_size != 130:
+            print("Invalid packet size. Skipping packet, with size:", packet_size)
             continue
 
-        # Unpack the remaining fields
-        print(packet_size)
-        try:
-            symbol, sequence, timestamp, ltp, ltq, volume, bid_price, bid_qty, ask_price, ask_qty, open_interest, prev_close, prev_open_interest = struct.unpack(
-                '<30sQQQQQQQQQQQQ', data[4:])
-        except struct.error as e:
-            print("Error unpacking fields:", e)
-            continue
-        # Decode the symbol string
-        symbol = symbol.decode('utf-8').rstrip('\x00')
+        packet_thread = threading.Thread(target=process_packet, args=(data,))
+        packet_thread.start()
 
-        # Print the unpacked fields
-        print("Packet Size:", packet_size)
-        print("Symbol:", symbol)
-        print("Sequence Number:", sequence)
-        print("Timestamp:", timestamp)
-        print("Last Traded Price (LTP):", ltp)
-        print("Last Traded Quantity (LTQ):", ltq)
-        print("Volume:", volume)
-        print("Bid Price:", bid_price)
-        print("Bid Quantity:", bid_qty)
-        print("Ask Price:", ask_price)
-        print("Ask Quantity:", ask_qty)
-        print("Open Interest:", open_interest)
-        print("Previous Close Price:", prev_close)
-        print("Previous Open Interest:", prev_open_interest)
 
-        total += 1
+server_address = ('localhost', 9011)
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_socket.settimeout(600)
+try:
+    client_socket.connect(server_address)
+    client_socket.sendall(b'\x01')
+
+    snapshot_data = client_socket.recv(130)
+    print("Received snapshot data size:", len(snapshot_data))
+    print("Snapshot Data:", snapshot_data)
+
+    process_packet(snapshot_data)
+    receive_thread = threading.Thread(target=receive_packets, args=(client_socket,))
+    receive_thread.start()
+
+    receive_thread.join()
 
 finally:
-    # Close the client socket when done or in case of an error
     client_socket.close()
